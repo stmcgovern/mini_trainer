@@ -1331,7 +1331,7 @@ def setup_training_components(
         eps=eps,
         weight_decay=weight_decay,
     )
-    optimizer = osft_utils.optim_wrapper(optimizer, model)
+    osft_utils.register_osft_hooks(optimizer, model, fsdp_model=model)
     # Prepare scheduler kwargs
     if scheduler_kwargs is None:
         scheduler_kwargs = {}

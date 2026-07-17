@@ -2429,13 +2429,49 @@ def create_osft_model_class(base_cls) -> type[OSFTModel]:
     return ModelWithOSFT
 
 
-def optim_wrapper(optimizer, model):
-    """Wrap optimizer.step to project gradients before and parameters after each update.
+def register_osft_hooks(optimizer, model, fsdp_model=None):
+    """Register OSFT projection as optimizer pre/post-step hooks.
 
     Pre-step gradient projection keeps the optimizer's moment estimates in the
     correct subspace.  Post-step parameter projection corrects for the fact
     that AdamW's element-wise rescaling (m̂_t / √v̂_t) can rotate the update
     out of the orthogonal complement of the frozen subspace.
+
+    Args:
+        optimizer: The optimizer to hook into.
+        model: Model with project_gradients/project_parameters methods.
+        fsdp_model: Optional FSDP2 root module. When provided, records
+            set_post_optim_event after projection so the next forward's
+            all-gather doesn't false-depend on default stream work.
+
+    Returns:
+        Tuple of RemovableHandle, or None if model lacks project_gradients.
+    """
+    if not hasattr(model, "project_gradients"):
+        return None
+
+    def pre_hook(opt, args, kwargs):
+        model.project_gradients()
+        return None
+
+    def post_hook(opt, args, kwargs):
+        if hasattr(model, "project_parameters"):
+            model.project_parameters()
+        if fsdp_model is not None and hasattr(fsdp_model, "set_post_optim_event"):
+            event = torch.cuda.current_stream().record_event()
+            fsdp_model.set_post_optim_event(event)
+
+    h1 = optimizer.register_step_pre_hook(pre_hook)
+    h2 = optimizer.register_step_post_hook(post_hook)
+    return h1, h2
+
+
+def optim_wrapper(optimizer, model):
+    """Wrap optimizer.step to project gradients before and parameters after each update.
+
+    Deprecated: use register_osft_hooks() instead. This function monkey-patches
+    optimizer.step, which is fragile and incompatible with optimizer hook
+    composition.
     """
     if not hasattr(model, "project_gradients"):
         return optimizer
