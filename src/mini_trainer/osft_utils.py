@@ -8,9 +8,11 @@ from typing import Protocol
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 from torch.distributed.tensor import DTensor
+from torch.profiler import record_function
 from tqdm import tqdm
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssForCausalLM
 
@@ -609,6 +611,22 @@ def _writeback_local(dtensor: torch.Tensor, local_tensor: torch.Tensor) -> None:
         dtensor.copy_(local_tensor)
 
 
+OSFT_COMPILE = os.getenv("OSFT_COMPILE", "0").lower() in ("1", "true")
+
+
+def _project_V_kernel_eager(local_dV, V_high_full):
+    coeff = torch.mm(local_dV, V_high_full.t())
+    local_dV.addmm_(coeff, V_high_full, alpha=-1.0)
+    return local_dV
+
+
+_project_V_kernel = (
+    torch.compile(_project_V_kernel_eager, dynamic=False)
+    if OSFT_COMPILE
+    else _project_V_kernel_eager
+)
+
+
 def project_parameter_to_orthogonal_space(
     svd_dict: SVDDecompositionDict,
     *,
@@ -652,7 +670,7 @@ def project_parameter_to_orthogonal_space(
 
         proj_coeff = torch.mm(local_U_high.transpose(0, 1), local_U_low)
         if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(proj_coeff, op=dist.ReduceOp.SUM)
+            proj_coeff = funcol.all_reduce(proj_coeff, reduceOp="sum", group=dist.distributed_c10d._get_default_group())
         local_U_low.addmm_(local_U_high, proj_coeff, alpha=-1.0)
 
         _writeback_local(U_low.data, local_U_low)
@@ -706,8 +724,7 @@ def project_parameter_to_orthogonal_space(
         if can_cache:
             cache_holder._osft_v_high_full = V_high_full.detach()
 
-    coeff = torch.mm(local_V_low, V_high_full.transpose(0, 1))
-    local_V_low.addmm_(coeff, V_high_full, alpha=-1.0)
+    _project_V_kernel(local_V_low, V_high_full)
 
     _writeback_local(V_low.data, local_V_low)
 
@@ -762,7 +779,7 @@ def project_gradient_to_orthogonal_space(
 
         proj_coeff = torch.mm(local_U_high.transpose(0, 1), local_dU)
         if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(proj_coeff, op=dist.ReduceOp.SUM)
+            proj_coeff = funcol.all_reduce(proj_coeff, reduceOp="sum", group=dist.distributed_c10d._get_default_group())
         local_dU.addmm_(local_U_high, proj_coeff, alpha=-1.0)
 
         _writeback_local(dU, local_dU)
@@ -827,9 +844,7 @@ def project_gradient_to_orthogonal_space(
                 # nn.Module.__setattr__ registering it into state_dict.
                 cache_holder._osft_v_high_full = V_high_full.detach()
 
-        # Two local matmuls — no (M, M) intermediate
-        coeff = torch.mm(local_dV, V_high_full.transpose(0, 1))  # (k_low/P, k_high)
-        local_dV.addmm_(coeff, V_high_full, alpha=-1.0)  # (k_low/P, M)
+        _project_V_kernel(local_dV, V_high_full)
 
         _writeback_local(dV, local_dV)
 
@@ -2157,6 +2172,21 @@ def create_osft_model_class(base_cls) -> type[OSFTModel]:
             }
             return svd_dict
 
+        def _get_u_coeff_buffer(self, needed_numel, device, dtype):
+            """Return a reusable flat buffer for batched U coefficients.
+
+            Lazily allocated on first call; grown with data preservation if
+            needed (only happens during the first step while the total size
+            is being discovered — after that the buffer is stable).
+            """
+            buf = getattr(self, "_u_coeff_buffer", None)
+            if buf is None or buf.numel() < needed_numel or buf.device != device:
+                new_buf = torch.empty(needed_numel, device=device, dtype=dtype)
+                if buf is not None and buf.device == device:
+                    new_buf[: buf.numel()].copy_(buf)
+                self._u_coeff_buffer = new_buf
+            return self._u_coeff_buffer
+
         def project_gradients(self):
             """
             Applies orthogonal projection to gradients of low-rank components to avoid interfering
@@ -2175,109 +2205,118 @@ def create_osft_model_class(base_cls) -> type[OSFTModel]:
             Default is off because the cache is replicated on every FSDP2 rank
             (~5.1 GB for Llama-8B, infeasible for 70B+).
             """
-            is_distributed = dist.is_initialized() and dist.get_world_size() > 1
+            with record_function("osft::project_gradients"):
+                is_distributed = dist.is_initialized() and dist.get_world_size() > 1
 
-            # Collect OSFT modules
-            osft_modules = []
-            for module in self.modules():
-                if (
-                    hasattr(module, "osft_params")
-                    and hasattr(module, "osft_U_high")
-                    and hasattr(module, "osft_S_high")
-                    and hasattr(module, "osft_V_high")
-                ):
-                    osft_modules.append(module)
+                # Collect OSFT modules
+                osft_modules = []
+                for module in self.modules():
+                    if (
+                        hasattr(module, "osft_params")
+                        and hasattr(module, "osft_U_high")
+                        and hasattr(module, "osft_S_high")
+                        and hasattr(module, "osft_V_high")
+                    ):
+                        osft_modules.append(module)
 
-            if not osft_modules:
-                return
+                if not osft_modules:
+                    return
 
-            # Non-distributed: project each module individually (no all-reduces)
-            if not is_distributed:
-                for module in osft_modules:
-                    try:
-                        svd_dict = self.get_svd_dict_for_module(module)
-                    except ValueError as err:
-                        raise ValueError(f"error in projecting gradients for module: {module}") from err
-                    project_gradient_to_orthogonal_space(svd_dict, cache_holder=module)
-                return
+                # Non-distributed: project each module individually (no all-reduces)
+                if not is_distributed:
+                    for module in osft_modules:
+                        try:
+                            svd_dict = self.get_svd_dict_for_module(module)
+                        except ValueError as err:
+                            raise ValueError(f"error in projecting gradients for module: {module}") from err
+                        project_gradient_to_orthogonal_space(svd_dict, cache_holder=module)
+                    return
 
-            # Distributed: batch U projection all-reduces.
-            #
-            # Batching is valid because all-reduce(SUM) distributes over
-            # concatenation: allreduce(cat([a, b])) = cat([allreduce(a),
-            # allreduce(b)]).  The per-target coefficient matrices are
-            # independent, so the batched result is mathematically identical
-            # to the unbatched path.
-            #
-            # Phase 1: Compute local U projection coefficients (no all-reduce yet).
-            # Each coeff = U_high^T @ dU is a (k, k_low) partial sum over the
-            # sharded N dimension (FSDP2 Shard(0) on U_high).
-            u_work = []  # (local_U_high, local_dU, dU, coeff_shape) per target
-            u_flat_parts = []
-            svd_dicts = []
-            svd_modules = []
+                # Distributed: batch U projection all-reduces.
+                #
+                # Batching is valid because all-reduce(SUM) distributes over
+                # concatenation: allreduce(cat([a, b])) = cat([allreduce(a),
+                # allreduce(b)]).  The per-target coefficient matrices are
+                # independent, so the batched result is mathematically identical
+                # to the unbatched path.
+                #
+                # Phase 1: Compute local U projection coefficients (no all-reduce yet).
+                # Each coeff = U_high^T @ dU is a (k, k_low) partial sum over the
+                # sharded N dimension (FSDP2 Shard(0) on U_high).
+                process_group = dist.distributed_c10d._get_default_group()
+                u_work = []  # (local_U_high, local_dU, dU, coeff_shape) per target
+                svd_dicts = []
+                svd_modules = []
+                buf_offset = 0
 
-            for module in osft_modules:
-                try:
-                    svd_dict = self.get_svd_dict_for_module(module)
-                except ValueError as err:
-                    raise ValueError(f"error in projecting gradients for module: {module}") from err
-                svd_dicts.append(svd_dict)
-                svd_modules.append(module)
+                with record_function("osft::U_coeff_collect"):
+                    for module in osft_modules:
+                        try:
+                            svd_dict = self.get_svd_dict_for_module(module)
+                        except ValueError as err:
+                            raise ValueError(f"error in projecting gradients for module: {module}") from err
+                        svd_dicts.append(svd_dict)
+                        svd_modules.append(module)
 
-                if svd_dict["U_low"].grad is not None:
-                    dU = svd_dict["U_low"].grad
-                    U_high = svd_dict["U_high"]
-                    local_U_high = _to_local(U_high)
-                    local_dU = _to_local(dU)
+                        if svd_dict["U_low"].grad is not None:
+                            dU = svd_dict["U_low"].grad
+                            U_high = svd_dict["U_high"]
+                            local_U_high = _to_local(U_high)
+                            local_dU = _to_local(dU)
 
-                    proj_coeff = torch.mm(local_U_high.transpose(0, 1), local_dU)
-                    u_work.append((local_U_high, local_dU, dU, proj_coeff.shape))
-                    u_flat_parts.append(proj_coeff.flatten())
+                            proj_coeff = torch.mm(local_U_high.transpose(0, 1), local_dU)
+                            numel = proj_coeff.numel()
+                            buf = self._get_u_coeff_buffer(buf_offset + numel, proj_coeff.device, proj_coeff.dtype)
+                            buf[buf_offset : buf_offset + numel].copy_(proj_coeff.flatten())
+                            u_work.append((local_U_high, local_dU, dU, proj_coeff.shape))
+                            buf_offset += numel
 
-            # Phase 2: Single batched all-reduce for all U coefficients
-            if u_flat_parts:
-                batched = torch.cat(u_flat_parts)
-                dist.all_reduce(batched, op=dist.ReduceOp.SUM)
+                # Phase 2: Single batched all-reduce for all U coefficients
+                if u_work:
+                    with record_function("osft::U_allreduce"):
+                        batched = self._u_coeff_buffer[:buf_offset]
+                        batched = funcol.all_reduce(batched, reduceOp="sum", group=process_group)
 
-                # Phase 3: Split back and apply U projections
-                offset = 0
-                for local_U_high, local_dU, dU, coeff_shape in u_work:
-                    numel = coeff_shape[0] * coeff_shape[1]
-                    proj_coeff = batched[offset : offset + numel].reshape(coeff_shape)
-                    offset += numel
+                    # Phase 3: Split back and apply U projections
+                    with record_function("osft::U_apply"):
+                        offset = 0
+                        for local_U_high, local_dU, dU, coeff_shape in u_work:
+                            numel = coeff_shape[0] * coeff_shape[1]
+                            proj_coeff = batched[offset : offset + numel].reshape(coeff_shape)
+                            offset += numel
 
-                    local_dU.addmm_(local_U_high, proj_coeff, alpha=-1.0)
+                            local_dU.addmm_(local_U_high, proj_coeff, alpha=-1.0)
 
-                    _writeback_local(dU, local_dU)
+                            _writeback_local(dU, local_dU)
 
-                assert offset == batched.numel(), (
-                    f"Batch split consumed {offset} elements but tensor has {batched.numel()}"
-                )
+                        assert offset == batched.numel(), (
+                            f"Batch split consumed {offset} elements but tensor has {batched.numel()}"
+                        )
 
-            # V projections: per-module factored V all-gather.
-            # Reuse the shared function with skip_u=True to avoid code
-            # duplication — the V projection logic is identical to the
-            # non-batched path.
-            caches_populated_this_call = 0
-            for svd_dict, module in zip(svd_dicts, svd_modules):
-                had_cache = hasattr(module, "_osft_v_high_full")
-                project_gradient_to_orthogonal_space(svd_dict, skip_u=True, cache_holder=module)
-                if not had_cache and hasattr(module, "_osft_v_high_full"):
-                    caches_populated_this_call += 1
+                # V projections: per-module factored V all-gather.
+                # Reuse the shared function with skip_u=True to avoid code
+                # duplication — the V projection logic is identical to the
+                # non-batched path.
+                with record_function("osft::V_projection"):
+                    caches_populated_this_call = 0
+                    for svd_dict, module in zip(svd_dicts, svd_modules):
+                        had_cache = hasattr(module, "_osft_v_high_full")
+                        project_gradient_to_orthogonal_space(svd_dict, skip_u=True, cache_holder=module)
+                        if not had_cache and hasattr(module, "_osft_v_high_full"):
+                            caches_populated_this_call += 1
 
-            if caches_populated_this_call > 0:
-                total_bytes = sum(
-                    module._osft_v_high_full.nelement() * module._osft_v_high_full.element_size()
-                    for module in self.modules()
-                    if hasattr(module, "_osft_v_high_full")
-                )
-                log_rank_0(
-                    f"Cached {caches_populated_this_call} V_high tensors "
-                    f"({total_bytes / 1e9:.2f} GB). "
-                    f"Subsequent steps skip V all-gathers. "
-                    f"Set OSFT_CACHE_V=0 to disable."
-                )
+                if caches_populated_this_call > 0:
+                    total_bytes = sum(
+                        module._osft_v_high_full.nelement() * module._osft_v_high_full.element_size()
+                        for module in self.modules()
+                        if hasattr(module, "_osft_v_high_full")
+                    )
+                    log_rank_0(
+                        f"Cached {caches_populated_this_call} V_high tensors "
+                        f"({total_bytes / 1e9:.2f} GB). "
+                        f"Subsequent steps skip V all-gathers. "
+                        f"Set OSFT_CACHE_V=0 to disable."
+                    )
 
         @torch.no_grad()
         def project_parameters(self):
@@ -2298,77 +2337,86 @@ def create_osft_model_class(base_cls) -> type[OSFTModel]:
             and V projections use the factored per-module all-gather (with
             optional caching via ``OSFT_CACHE_V``).
             """
-            is_distributed = dist.is_initialized() and dist.get_world_size() > 1
+            with record_function("osft::project_parameters"):
+                is_distributed = dist.is_initialized() and dist.get_world_size() > 1
 
-            # Collect OSFT modules
-            osft_modules = []
-            for module in self.modules():
-                if (
-                    hasattr(module, "osft_params")
-                    and hasattr(module, "osft_U_high")
-                    and hasattr(module, "osft_S_high")
-                    and hasattr(module, "osft_V_high")
-                ):
-                    osft_modules.append(module)
+                # Collect OSFT modules
+                osft_modules = []
+                for module in self.modules():
+                    if (
+                        hasattr(module, "osft_params")
+                        and hasattr(module, "osft_U_high")
+                        and hasattr(module, "osft_S_high")
+                        and hasattr(module, "osft_V_high")
+                    ):
+                        osft_modules.append(module)
 
-            if not osft_modules:
-                return
+                if not osft_modules:
+                    return
 
-            # Non-distributed: project each module individually
-            if not is_distributed:
-                for module in osft_modules:
-                    try:
-                        svd_dict = self.get_svd_dict_for_module(module)
-                    except ValueError as err:
-                        raise ValueError(f"error in projecting parameters for module: {module}") from err
-                    project_parameter_to_orthogonal_space(svd_dict, cache_holder=module)
-                return
+                # Non-distributed: project each module individually
+                if not is_distributed:
+                    for module in osft_modules:
+                        try:
+                            svd_dict = self.get_svd_dict_for_module(module)
+                        except ValueError as err:
+                            raise ValueError(f"error in projecting parameters for module: {module}") from err
+                        project_parameter_to_orthogonal_space(svd_dict, cache_holder=module)
+                    return
 
-            # Distributed: batch U projection all-reduces (same strategy as project_gradients).
-            u_work = []
-            u_flat_parts = []
-            svd_dicts = []
-            svd_modules = []
+                # Distributed: batch U projection all-reduces (same strategy as project_gradients).
+                process_group = dist.distributed_c10d._get_default_group()
+                u_work = []
+                svd_dicts = []
+                svd_modules = []
+                buf_offset = 0
 
-            for module in osft_modules:
-                try:
-                    svd_dict = self.get_svd_dict_for_module(module)
-                except ValueError as err:
-                    raise ValueError(f"error in projecting parameters for module: {module}") from err
-                svd_dicts.append(svd_dict)
-                svd_modules.append(module)
+                with record_function("osft::U_coeff_collect"):
+                    for module in osft_modules:
+                        try:
+                            svd_dict = self.get_svd_dict_for_module(module)
+                        except ValueError as err:
+                            raise ValueError(f"error in projecting parameters for module: {module}") from err
+                        svd_dicts.append(svd_dict)
+                        svd_modules.append(module)
 
-                U_low = svd_dict["U_low"]
-                U_high = svd_dict["U_high"]
-                local_U_high = _to_local(U_high)
-                local_U_low = _to_local(U_low.data)
+                        U_low = svd_dict["U_low"]
+                        U_high = svd_dict["U_high"]
+                        local_U_high = _to_local(U_high)
+                        local_U_low = _to_local(U_low.data)
 
-                proj_coeff = torch.mm(local_U_high.transpose(0, 1), local_U_low)
-                u_work.append((local_U_high, local_U_low, U_low, proj_coeff.shape))
-                u_flat_parts.append(proj_coeff.flatten())
+                        proj_coeff = torch.mm(local_U_high.transpose(0, 1), local_U_low)
+                        numel = proj_coeff.numel()
+                        buf = self._get_u_coeff_buffer(buf_offset + numel, proj_coeff.device, proj_coeff.dtype)
+                        buf[buf_offset : buf_offset + numel].copy_(proj_coeff.flatten())
+                        u_work.append((local_U_high, local_U_low, U_low, proj_coeff.shape))
+                        buf_offset += numel
 
-            # Single batched all-reduce for all U coefficients
-            if u_flat_parts:
-                batched = torch.cat(u_flat_parts)
-                dist.all_reduce(batched, op=dist.ReduceOp.SUM)
+                # Single batched all-reduce for all U coefficients
+                if u_work:
+                    with record_function("osft::U_allreduce"):
+                        batched = self._u_coeff_buffer[:buf_offset]
+                        batched = funcol.all_reduce(batched, reduceOp="sum", group=process_group)
 
-                offset = 0
-                for local_U_high, local_U_low, U_low, coeff_shape in u_work:
-                    numel = coeff_shape[0] * coeff_shape[1]
-                    proj_coeff = batched[offset : offset + numel].reshape(coeff_shape)
-                    offset += numel
+                    with record_function("osft::U_apply"):
+                        offset = 0
+                        for local_U_high, local_U_low, U_low, coeff_shape in u_work:
+                            numel = coeff_shape[0] * coeff_shape[1]
+                            proj_coeff = batched[offset : offset + numel].reshape(coeff_shape)
+                            offset += numel
 
-                    local_U_low.addmm_(local_U_high, proj_coeff, alpha=-1.0)
+                            local_U_low.addmm_(local_U_high, proj_coeff, alpha=-1.0)
 
-                    _writeback_local(U_low.data, local_U_low)
+                            _writeback_local(U_low.data, local_U_low)
 
-                assert offset == batched.numel(), (
-                    f"Batch split consumed {offset} elements but tensor has {batched.numel()}"
-                )
+                        assert offset == batched.numel(), (
+                            f"Batch split consumed {offset} elements but tensor has {batched.numel()}"
+                        )
 
-            # V projections: per-module factored V all-gather (skip_u=True).
-            for svd_dict, module in zip(svd_dicts, svd_modules):
-                project_parameter_to_orthogonal_space(svd_dict, skip_u=True, cache_holder=module)
+                # V projections: per-module factored V all-gather (skip_u=True).
+                with record_function("osft::V_projection"):
+                    for svd_dict, module in zip(svd_dicts, svd_modules):
+                        project_parameter_to_orthogonal_space(svd_dict, skip_u=True, cache_holder=module)
 
         def prepare_state_dict_for_save(self, state_dict):
             """Reconstruct dense weights into ``state_dict`` for saving with memory optimization."""

@@ -1608,6 +1608,7 @@ class TestBatchedUAllReduce:
         initial state (avoids deepcopy issues with dynamic OSFT classes).
         """
         import torch.distributed as dist
+        import torch.distributed._functional_collectives as funcol
 
         # Create two identical models from the same seed
         torch.manual_seed(99)
@@ -1637,9 +1638,10 @@ class TestBatchedUAllReduce:
 
         monkeypatch.setattr(dist, "is_initialized", lambda: True)
         monkeypatch.setattr(dist, "get_world_size", lambda: 2)
-        # No-op all_reduce: with a single real rank, the local value IS the
-        # global value, so identity is correct.
-        monkeypatch.setattr(dist, "all_reduce", lambda tensor, op=None: None)
+        monkeypatch.setattr(dist.distributed_c10d, "_get_default_group", lambda: "fake_group")
+        # No-op all_reduce: funcol.all_reduce returns a new tensor (identity
+        # for single-rank), so we clone the input to mimic the non-mutating API.
+        monkeypatch.setattr(funcol, "all_reduce", lambda tensor, reduceOp=None, group=None: tensor.clone())
         # V projection detects that local_V_high is already the full tensor
         # (shape[0] == rank_high) and skips all_gather, so no mock needed.
         model_bat.project_gradients()  # takes batched path
@@ -2580,6 +2582,7 @@ class TestPostStepParameterProjection:
         but for parameter projection instead of gradient projection.
         """
         import torch.distributed as dist
+        import torch.distributed._functional_collectives as funcol
 
         torch.manual_seed(99)
         model_ref = self._create_multi_target_model()
@@ -2612,7 +2615,8 @@ class TestPostStepParameterProjection:
         # Batched: mock dist to force batched path
         monkeypatch.setattr(dist, "is_initialized", lambda: True)
         monkeypatch.setattr(dist, "get_world_size", lambda: 2)
-        monkeypatch.setattr(dist, "all_reduce", lambda tensor, op=None: None)
+        monkeypatch.setattr(dist.distributed_c10d, "_get_default_group", lambda: "fake_group")
+        monkeypatch.setattr(funcol, "all_reduce", lambda tensor, reduceOp=None, group=None: tensor.clone())
         model_bat.project_parameters()
 
         # Compare every parameter
