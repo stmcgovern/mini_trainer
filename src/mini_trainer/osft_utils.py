@@ -1,7 +1,6 @@
 import gc
 import math
 import os
-import types
 import typing as t
 from dataclasses import dataclass
 from typing import Protocol
@@ -2464,26 +2463,3 @@ def register_osft_hooks(optimizer, model, fsdp_model=None):
     h1 = optimizer.register_step_pre_hook(pre_hook)
     h2 = optimizer.register_step_post_hook(post_hook)
     return h1, h2
-
-
-def optim_wrapper(optimizer, model):
-    """Wrap optimizer.step to project gradients before and parameters after each update.
-
-    Deprecated: use register_osft_hooks() instead. This function monkey-patches
-    optimizer.step, which is fragile and incompatible with optimizer hook
-    composition.
-    """
-    if not hasattr(model, "project_gradients"):
-        return optimizer
-
-    orig_step = optimizer.step
-
-    def step(self, *args, **kwargs):
-        model.project_gradients()
-        result = orig_step(*args, **kwargs)
-        if hasattr(model, "project_parameters"):
-            model.project_parameters()
-        return result
-
-    optimizer.step = types.MethodType(step, optimizer)
-    return optimizer

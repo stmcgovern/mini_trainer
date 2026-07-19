@@ -177,8 +177,7 @@ class TestSchedulerConfiguration:
         mock_wrap.return_value = model
         model.parameters.return_value = [torch.nn.Parameter(torch.randn(10, 10))]
 
-        # Mock the optim_wrapper to return the optimizer unchanged
-        with patch("mini_trainer.osft_utils.optim_wrapper", side_effect=lambda opt, model: opt):
+        with patch("mini_trainer.osft_utils.register_osft_hooks", side_effect=lambda opt, model, fsdp_model=None: None):
             model, optimizer, scheduler = setup_training_components(
                 model=model,
                 learning_rate=1e-5,

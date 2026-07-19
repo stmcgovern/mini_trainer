@@ -256,12 +256,12 @@ class TestSetupTrainingComponents:
     @patch("mini_trainer.setup_model_for_training.wrap_fsdp2")
     @patch("transformers.get_scheduler")
     @patch("mini_trainer.setup_model_for_training.torch.optim.AdamW")
-    @patch("mini_trainer.osft_utils.optim_wrapper")
+    @patch("mini_trainer.osft_utils.register_osft_hooks")
     @patch("mini_trainer.setup_model_for_training.log_rank_0")
     def test_setup_training_components_basic(
         self,
         mock_log,
-        mock_optim_wrapper,
+        mock_hooks,
         mock_adamw,
         mock_scheduler,
         mock_wrap,
@@ -269,7 +269,6 @@ class TestSetupTrainingComponents:
     ):
         """Test basic training components setup."""
         mock_wrapped_model = MagicMock()
-        # Set up mock parameters with requires_grad=True for the wrapped model
         mock_param = MagicMock()
         mock_param.requires_grad = True
         mock_wrapped_model.parameters = MagicMock(return_value=[mock_param])
@@ -277,9 +276,6 @@ class TestSetupTrainingComponents:
 
         mock_optimizer = MagicMock()
         mock_adamw.return_value = mock_optimizer
-
-        mock_wrapped_optimizer = MagicMock()
-        mock_optim_wrapper.return_value = mock_wrapped_optimizer
 
         mock_lr_scheduler = MagicMock()
         mock_lr_scheduler.get_last_lr = MagicMock(return_value=[1e-5])
@@ -293,13 +289,11 @@ class TestSetupTrainingComponents:
         )
 
         assert model == mock_wrapped_model
-        assert optimizer == mock_wrapped_optimizer
+        assert optimizer == mock_optimizer
         assert lr_scheduler == mock_lr_scheduler
 
-        # Check FSDP2 wrapping
         mock_wrap.assert_called_once_with(mock_model, compile_model=False)
 
-        # Check optimizer creation
         mock_adamw.assert_called_once_with(
             mock_wrapped_model.parameters(),
             lr=1e-5,
@@ -308,13 +302,11 @@ class TestSetupTrainingComponents:
             weight_decay=0.0,
         )
 
-        # Check optimizer wrapping
-        mock_optim_wrapper.assert_called_once_with(mock_optimizer, mock_wrapped_model)
+        mock_hooks.assert_called_once_with(mock_optimizer, mock_wrapped_model, fsdp_model=mock_wrapped_model)
 
-        # Check scheduler creation with new parameters
         mock_scheduler.assert_called_once_with(
             name="constant_with_warmup",
-            optimizer=mock_wrapped_optimizer,
+            optimizer=mock_optimizer,
             num_warmup_steps=10,
             num_training_steps=None,
             scheduler_specific_kwargs={},
@@ -323,12 +315,12 @@ class TestSetupTrainingComponents:
     @patch("mini_trainer.setup_model_for_training.wrap_fsdp2")
     @patch("transformers.get_scheduler")
     @patch("mini_trainer.setup_model_for_training.torch.optim.AdamW")
-    @patch("mini_trainer.osft_utils.optim_wrapper")
+    @patch("mini_trainer.osft_utils.register_osft_hooks")
     @patch("mini_trainer.setup_model_for_training.log_rank_0")
     def test_setup_training_components_different_scheduler(
         self,
         mock_log,
-        mock_optim_wrapper,
+        mock_hooks,
         mock_adamw,
         mock_scheduler,
         mock_wrap,
@@ -338,7 +330,6 @@ class TestSetupTrainingComponents:
         mock_wrap.return_value = mock_model
         mock_optimizer = MagicMock()
         mock_adamw.return_value = mock_optimizer
-        mock_optim_wrapper.return_value = mock_optimizer
 
         mock_lr_scheduler = MagicMock()
         mock_scheduler.return_value = mock_lr_scheduler
@@ -368,7 +359,7 @@ class TestIntegration:
         # Skipping for unit tests to avoid downloading models
         pytest.skip("Integration test requiring actual model download")
 
-    @patch("mini_trainer.osft_utils.optim_wrapper")
+    @patch("mini_trainer.osft_utils.register_osft_hooks")
     @patch("transformers.get_scheduler")
     @patch("mini_trainer.setup_model_for_training.torch.optim.AdamW")
     @patch("mini_trainer.setup_model_for_training.log_rank_0")
@@ -385,15 +376,13 @@ class TestIntegration:
         mock_log,
         mock_adamw,
         mock_sched,
-        mock_opt_wrap,
+        mock_hooks,
     ):
         """Test end-to-end flow with mocks."""
-        # Setup tokenizer mock
         mock_tokenizer = MagicMock()
         mock_tokenizer.__len__ = MagicMock(return_value=32000)
         mock_tok.return_value = mock_tokenizer
 
-        # Setup model mock
         mock_model = MagicMock()
         mock_model.__class__.__name__ = "LlamaForCausalLM"
         mock_model.config = MagicMock()
@@ -402,10 +391,8 @@ class TestIntegration:
         mock_model_cls.return_value = mock_model
         mock_wrap.return_value = mock_model
 
-        # Setup optimizer and scheduler mocks
         mock_optimizer = MagicMock()
         mock_adamw.return_value = mock_optimizer
-        mock_opt_wrap.return_value = mock_optimizer
         mock_scheduler = MagicMock()
         mock_sched.return_value = mock_scheduler
 

@@ -26,7 +26,6 @@ import torch.nn as nn
 
 from mini_trainer.osft_utils import (
     create_osft_model_class,
-    optim_wrapper,
     register_osft_hooks,
 )
 
@@ -152,64 +151,45 @@ def _run_c2_grad_accumulation():
     assert n_errors <= 1, f"C2: sanitizer detected {n_errors} stream race(s), expected <= 1 (known false positive)"
 
 
-def _run_c3_numerical_equivalence():
-    """C3: Hook path produces identical results to optim_wrapper path."""
+def _run_c3_orthogonality():
+    """C3: Hooks maintain orthogonality over training steps on FSDP2."""
     from torch.distributed.fsdp import fully_shard
 
     local_rank = _init_distributed()
+    torch.manual_seed(42)
 
-    results = {}
-    for mode in ("hooks", "wrapper"):
-        torch.manual_seed(42)
-        model = _make_osft_model(f"cuda:{local_rank}")
+    model = _make_osft_model(f"cuda:{local_rank}")
+    for module in model.children():
+        fully_shard(module)
+    fully_shard(model)
 
-        for module in model.children():
-            fully_shard(module)
-        fully_shard(model)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optim = torch.optim.Adam(trainable, lr=1e-3)
+    register_osft_hooks(optim, model, fsdp_model=model)
 
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        optim = torch.optim.Adam(trainable, lr=1e-3)
+    torch.manual_seed(123 + local_rank)
+    for step in range(8):
+        optim.zero_grad()
+        inp = torch.randn(4, 64, device=f"cuda:{local_rank}")
+        loss = model(inp).sum()
+        loss.backward()
+        optim.step()
 
-        if mode == "hooks":
-            register_osft_hooks(optim, model, fsdp_model=model)
-        else:
-            optim_wrapper(optim, model)
+    torch.cuda.synchronize()
 
-        torch.manual_seed(123 + local_rank)
-        for step in range(8):
-            optim.zero_grad()
-            inp = torch.randn(4, 64, device=f"cuda:{local_rank}")
-            loss = model(inp).sum()
-            loss.backward()
-            optim.step()
-
-        torch.cuda.synchronize()
-        param_snapshot = {}
-        for name, p in model.named_parameters():
-            if p.requires_grad:
-                local = p.data._local_tensor if hasattr(p.data, "_local_tensor") else p.data
-                param_snapshot[name] = local.detach().clone()
-        results[mode] = param_snapshot
-
-    mismatches = []
-    for name in results["hooks"]:
-        h = results["hooks"][name]
-        w = results["wrapper"][name]
-        diff = (h - w).abs().max().item()
-        if diff > 1e-5:
-            mismatches.append(f"{name}: max_diff={diff:.2e}")
+    max_dot = 0.0
+    for target in model.osft_targets.values():
+        U_high = target.U_high
+        U_low = target.U_low
+        local_Uh = U_high._local_tensor if hasattr(U_high, "_local_tensor") else U_high.detach()
+        local_Ul = U_low.data._local_tensor if hasattr(U_low.data, "_local_tensor") else U_low.data
+        dot = (local_Uh.T @ local_Ul).abs().max().item()
+        max_dot = max(max_dot, dot)
 
     if local_rank == 0:
-        if mismatches:
-            print(f"C3: FAILED - {len(mismatches)} param mismatch(es):")
-            for m in mismatches:
-                print(f"  {m}")
-        else:
-            print("C3: PASSED - hook path matches optim_wrapper path")
+        print(f"C3: max |U_high^T @ U_low| = {max_dot:.2e}")
 
-    assert len(mismatches) == 0, f"C3: hook path differs from optim_wrapper for {len(mismatches)} params: " + "; ".join(
-        mismatches
-    )
+    assert max_dot < 1e-4, f"C3: orthogonality violated, max dot product = {max_dot:.2e}"
 
 
 # -- torchrun entry point --
@@ -217,7 +197,7 @@ def _run_c3_numerical_equivalence():
 _TESTS = {
     "c1": _run_c1_single_layer_sanitizer,
     "c2": _run_c2_grad_accumulation,
-    "c3": _run_c3_numerical_equivalence,
+    "c3": _run_c3_orthogonality,
 }
 
 
@@ -277,7 +257,7 @@ class TestOSFTStreamSafety:
     def test_c2_grad_accumulation(self):
         _run_via_torchrun("c2")
 
-    def test_c3_numerical_equivalence(self):
+    def test_c3_orthogonality(self):
         _run_via_torchrun("c3")
 
 

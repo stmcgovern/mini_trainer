@@ -27,9 +27,9 @@ from mini_trainer.osft_utils import (
     create_osft_model_class,
     get_model_config,
     is_osft_param,
-    optim_wrapper,
     project_gradient_to_orthogonal_space,
     project_parameter_to_orthogonal_space,
+    register_osft_hooks,
 )
 from mini_trainer.setup_model_for_training import setup_model
 from mini_trainer.training_types import TorchrunArgs, TrainingArgs
@@ -1274,7 +1274,7 @@ class TestOSFTOrthogonality:
         optimizer = torch.optim.AdamW(osft_params, lr=1e-4)
 
         # Wrap optimizer to enable gradient projection
-        optim_wrapper(optimizer, model)
+        register_osft_hooks(optimizer, model)
 
         # Training step
         input_data = torch.randn(4, 16)
@@ -1322,7 +1322,7 @@ class TestOSFTOrthogonality:
         osft_params = [p for n, p in model.named_parameters() if "osft_params" in n]
         assert len(osft_params) > 0
         optimizer = torch.optim.AdamW(osft_params, lr=1e-4)
-        optim_wrapper(optimizer, model)
+        register_osft_hooks(optimizer, model)
 
         num_steps = 20
         for step in range(1, num_steps + 1):
@@ -1379,7 +1379,7 @@ class TestOSFTOrthogonality:
             osft_params = [p for n, p in model.named_parameters() if "osft_params" in n]
             assert len(osft_params) > 0
             optimizer = torch.optim.AdamW(osft_params, lr=1e-4)
-            optim_wrapper(optimizer, model)
+            register_osft_hooks(optimizer, model)
 
             # Single training step
             input_data = torch.randn(4, 16)
@@ -1567,7 +1567,7 @@ class TestBatchedUAllReduce:
 
         osft_params = [p for n, p in model.named_parameters() if "osft_params" in n]
         optimizer = torch.optim.AdamW(osft_params, lr=1e-4)
-        optim_wrapper(optimizer, model)
+        register_osft_hooks(optimizer, model)
 
         for step in range(1, 6):
             x8 = torch.randn(2, 8, dtype=torch.float64)
@@ -1909,14 +1909,13 @@ class TestVProjectionCache:
 
         osft_params = [p for n, p in model.named_parameters() if "osft_params" in n]
         optimizer = torch.optim.AdamW(osft_params, lr=1e-4)
-        optim_wrapper(optimizer, model)
+        register_osft_hooks(optimizer, model)
 
         for step in range(1, 11):
             x = torch.randn(4, 32)
             loss = model.linear(x).pow(2).sum()
             loss.backward()
 
-            # project_gradients is called inside optim_wrapper's step()
             optimizer.step()
 
             for module in model.modules():
@@ -2277,8 +2276,8 @@ class TestPostStepParameterProjection:
     AdamW's element-wise moment rescaling (m̂_t / √v̂_t) can rotate the
     parameter update out of the orthogonal complement of the frozen
     subspace, even when gradients are correctly projected beforehand.
-    The ``project_parameters`` method and updated ``optim_wrapper``
-    re-project parameters after each step to correct this.
+    The ``project_parameters`` method (called via ``register_osft_hooks``)
+    re-projects parameters after each step to correct this.
     """
 
     def _create_simple_osft_model(self, hidden_size=16, rank_ratio=0.5):
@@ -2442,7 +2441,7 @@ class TestPostStepParameterProjection:
         osft_params = [p for n, p in model.named_parameters() if "osft_params" in n]
         assert len(osft_params) > 0
         optimizer = torch.optim.AdamW(osft_params, lr=1e-2)
-        optim_wrapper(optimizer, model)
+        register_osft_hooks(optimizer, model)
 
         num_steps = 200
         for step in range(1, num_steps + 1):
@@ -2471,14 +2470,14 @@ class TestPostStepParameterProjection:
             f"AdamW subspace leak detected after {num_steps} steps:\n{tracker.get_summary()}"
         )
 
-    def test_optim_wrapper_calls_project_parameters(self):
-        """Test that the optim_wrapper calls project_parameters after step."""
+    def test_hooks_call_project_parameters(self):
+        """Test that register_osft_hooks calls project_parameters after step."""
         model = self._create_simple_osft_model(hidden_size=16, rank_ratio=0.5)
         model.train()
 
         osft_params = [p for n, p in model.named_parameters() if "osft_params" in n]
         optimizer = torch.optim.AdamW(osft_params, lr=1e-3)
-        optim_wrapper(optimizer, model)
+        register_osft_hooks(optimizer, model)
 
         # Track calls to project_parameters
         calls = []
@@ -2498,7 +2497,7 @@ class TestPostStepParameterProjection:
         loss.backward()
         optimizer.step()
 
-        assert "project_parameters" in calls, "optim_wrapper should call project_parameters after step"
+        assert "project_parameters" in calls, "register_osft_hooks should call project_parameters after step"
 
     def test_project_parameters_multi_target(self):
         """Test post-step projection works with multiple OSFT targets."""
@@ -2508,7 +2507,7 @@ class TestPostStepParameterProjection:
 
         osft_params = [p for n, p in model.named_parameters() if "osft_params" in n]
         optimizer = torch.optim.AdamW(osft_params, lr=1e-2)
-        optim_wrapper(optimizer, model)
+        register_osft_hooks(optimizer, model)
 
         for step in range(1, 51):
             x8 = torch.randn(2, 8, dtype=torch.float64)
