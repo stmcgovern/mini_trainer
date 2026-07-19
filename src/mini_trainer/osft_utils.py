@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+from torch.distributed.tensor import DTensor
 from tqdm import tqdm
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssForCausalLM
 
@@ -593,6 +594,21 @@ def reconstruct_weight_matrix(
     return reconstructed
 
 
+def _to_local(tensor: torch.Tensor) -> torch.Tensor:
+    if isinstance(tensor, DTensor):
+        return tensor._local_tensor
+    if hasattr(tensor, "to_local"):
+        return tensor.to_local()
+    return tensor
+
+
+def _writeback_local(dtensor: torch.Tensor, local_tensor: torch.Tensor) -> None:
+    if isinstance(dtensor, DTensor):
+        dtensor._local_tensor.copy_(local_tensor)
+    else:
+        dtensor.copy_(local_tensor)
+
+
 def project_parameter_to_orthogonal_space(
     svd_dict: SVDDecompositionDict,
     *,
@@ -631,23 +647,20 @@ def project_parameter_to_orthogonal_space(
     # Project U_low parameters to space orthogonal to U_high
     if not skip_u:
         U_low = svd_dict["U_low"]
-        local_U_high = getattr(U_high, "to_local", lambda: U_high)()
-        local_U_low = getattr(U_low.data, "to_local", lambda: U_low.data)()
+        local_U_high = _to_local(U_high)
+        local_U_low = _to_local(U_low.data)
 
         proj_coeff = torch.mm(local_U_high.transpose(0, 1), local_U_low)
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(proj_coeff, op=dist.ReduceOp.SUM)
         local_U_low.addmm_(local_U_high, proj_coeff, alpha=-1.0)
 
-        if hasattr(U_low.data, "_local_tensor"):
-            U_low.data._local_tensor.copy_(local_U_low)
-        else:
-            U_low.data.copy_(local_U_low)
+        _writeback_local(U_low.data, local_U_low)
 
     # Project V_low parameters: V_low -= (V_low @ V_high^T) @ V_high
     V_low = svd_dict["V_low"]
-    local_V_high = getattr(V_high, "to_local", lambda: V_high)()
-    local_V_low = getattr(V_low.data, "to_local", lambda: V_low.data)()
+    local_V_high = _to_local(V_high)
+    local_V_low = _to_local(V_low.data)
 
     # Reuse cached all-gathered V_high when available (same logic as gradient projection)
     can_cache = OSFT_CACHE_V and cache_holder is not None
@@ -696,10 +709,7 @@ def project_parameter_to_orthogonal_space(
     coeff = torch.mm(local_V_low, V_high_full.transpose(0, 1))
     local_V_low.addmm_(coeff, V_high_full, alpha=-1.0)
 
-    if hasattr(V_low.data, "_local_tensor"):
-        V_low.data._local_tensor.copy_(local_V_low)
-    else:
-        V_low.data.copy_(local_V_low)
+    _writeback_local(V_low.data, local_V_low)
 
 
 def project_gradient_to_orthogonal_space(
@@ -747,31 +757,22 @@ def project_gradient_to_orthogonal_space(
     # Project U_low gradients to space orthogonal to U_high
     if not skip_u and svd_dict["U_low"].grad is not None:
         dU = svd_dict["U_low"].grad
-        # Support distributed tensors by operating on the local shard
-        local_U_high = getattr(U_high, "to_local", lambda: U_high)()
-        local_dU = getattr(dU, "to_local", lambda: dU)()
+        local_U_high = _to_local(U_high)
+        local_dU = _to_local(dU)
 
-        # Perform projection computation using memory-efficient operations
-        # Memory-optimized projection: dU = dU - U_high @ (U_high.T @ dU)
-        # Use addmm_ for efficient in-place operation
-        # Compute local contribution to (U_high^T @ dU); all-reduce to get global projection
         proj_coeff = torch.mm(local_U_high.transpose(0, 1), local_dU)
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(proj_coeff, op=dist.ReduceOp.SUM)
-        # Apply projection using only local rows of U_high
         local_dU.addmm_(local_U_high, proj_coeff, alpha=-1.0)
 
-        if hasattr(dU, "_local_tensor"):
-            dU._local_tensor.copy_(local_dU)
-        else:
-            dU.copy_(local_dU)
+        _writeback_local(dU, local_dU)
 
     # Project V_low gradients: dV -= (dV @ V_high^T) @ V_high
     # All-gather V_high from FSDP2 shards (or use cache) — see docstring for cost analysis.
     if svd_dict["V_low"].grad is not None:
         dV = svd_dict["V_low"].grad
-        local_V_high = getattr(V_high, "to_local", lambda: V_high)()
-        local_dV = getattr(dV, "to_local", lambda: dV)()
+        local_V_high = _to_local(V_high)
+        local_dV = _to_local(dV)
 
         # V_high is frozen — reuse cached all-gathered tensor when available.
         can_cache = OSFT_CACHE_V and cache_holder is not None
@@ -830,10 +831,7 @@ def project_gradient_to_orthogonal_space(
         coeff = torch.mm(local_dV, V_high_full.transpose(0, 1))  # (k_low/P, k_high)
         local_dV.addmm_(coeff, V_high_full, alpha=-1.0)  # (k_low/P, M)
 
-        if hasattr(dV, "_local_tensor"):
-            dV._local_tensor.copy_(local_dV)
-        else:
-            dV.copy_(local_dV)
+        _writeback_local(dV, local_dV)
 
 
 def get_osft_target_parameters(model, osft_config):
@@ -2230,8 +2228,8 @@ def create_osft_model_class(base_cls) -> type[OSFTModel]:
                 if svd_dict["U_low"].grad is not None:
                     dU = svd_dict["U_low"].grad
                     U_high = svd_dict["U_high"]
-                    local_U_high = getattr(U_high, "to_local", lambda x=U_high: x)()
-                    local_dU = getattr(dU, "to_local", lambda x=dU: x)()
+                    local_U_high = _to_local(U_high)
+                    local_dU = _to_local(dU)
 
                     proj_coeff = torch.mm(local_U_high.transpose(0, 1), local_dU)
                     u_work.append((local_U_high, local_dU, dU, proj_coeff.shape))
@@ -2251,10 +2249,7 @@ def create_osft_model_class(base_cls) -> type[OSFTModel]:
 
                     local_dU.addmm_(local_U_high, proj_coeff, alpha=-1.0)
 
-                    if hasattr(dU, "_local_tensor"):
-                        dU._local_tensor.copy_(local_dU)
-                    else:
-                        dU.copy_(local_dU)
+                    _writeback_local(dU, local_dU)
 
                 assert offset == batched.numel(), (
                     f"Batch split consumed {offset} elements but tensor has {batched.numel()}"
@@ -2345,8 +2340,8 @@ def create_osft_model_class(base_cls) -> type[OSFTModel]:
 
                 U_low = svd_dict["U_low"]
                 U_high = svd_dict["U_high"]
-                local_U_high = getattr(U_high, "to_local", lambda x=U_high: x)()
-                local_U_low = getattr(U_low.data, "to_local", lambda x=U_low.data: x)()
+                local_U_high = _to_local(U_high)
+                local_U_low = _to_local(U_low.data)
 
                 proj_coeff = torch.mm(local_U_high.transpose(0, 1), local_U_low)
                 u_work.append((local_U_high, local_U_low, U_low, proj_coeff.shape))
@@ -2365,10 +2360,7 @@ def create_osft_model_class(base_cls) -> type[OSFTModel]:
 
                     local_U_low.addmm_(local_U_high, proj_coeff, alpha=-1.0)
 
-                    if hasattr(U_low.data, "_local_tensor"):
-                        U_low.data._local_tensor.copy_(local_U_low)
-                    else:
-                        U_low.data.copy_(local_U_low)
+                    _writeback_local(U_low.data, local_U_low)
 
                 assert offset == batched.numel(), (
                     f"Batch split consumed {offset} elements but tensor has {batched.numel()}"
