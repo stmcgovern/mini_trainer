@@ -1692,34 +1692,26 @@ class TestVProjectionCache:
         model.reinitialize_osft(decompose_existing_weights=True)
         return model
 
-    def test_cache_populated_after_first_projection(self, monkeypatch):
-        """V_high cache should be set on the module after the first call."""
+    def test_cache_populated_at_construction(self, monkeypatch):
+        """V_high cache should be set eagerly during state construction."""
 
         model = self._create_simple_osft_model()
         model.train()
 
-        # Before projection: no cache
-        for module in model.modules():
-            if hasattr(module, "osft_params"):
-                assert not hasattr(module, "_osft_v_high_full")
-
-        # Forward + backward
-        x = torch.randn(4, 32)
-        loss = model.linear(x).pow(2).sum()
-        loss.backward()
-
-        model.project_gradients()
-
-        # After projection: cache should exist
+        # Module-level cache is populated eagerly by OSFTProjectionState
         cached_count = 0
         for module in model.modules():
             if hasattr(module, "_osft_v_high_full"):
                 cached_count += 1
                 V = module._osft_v_high_full
                 assert V.ndim == 2
-                # Cached V_high should match V_high shape (k_high, M)
                 assert V.shape == module.osft_V_high.shape
         assert cached_count > 0
+
+        # State-level cache is also populated
+        state = model._projection_state
+        assert state is not None
+        assert len(state.v_high_fulls) == cached_count
 
     def test_cached_v_high_matches_original(self, monkeypatch):
         """Cached V_high should be identical to the original V_high (single GPU)."""
@@ -2076,9 +2068,10 @@ class TestUnevenShardDeinterleave:
             "rank_high": k_high,
         }
 
-        # Mock distributed
+        # Mock distributed (get_rank needed by torch.compile's structured logging)
         monkeypatch.setattr(dist, "is_initialized", lambda: True)
         monkeypatch.setattr(dist, "get_world_size", lambda: world_size)
+        monkeypatch.setattr(dist, "get_rank", lambda: 0)
         monkeypatch.setattr(dist, "all_gather_into_tensor", mock_all_gather)
 
         project_gradient_to_orthogonal_space(svd_dict, skip_u=True)

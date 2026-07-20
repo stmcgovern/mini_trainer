@@ -679,6 +679,7 @@ def _project_to_orthogonal_space(
     mode: str,
     skip_u: bool = False,
     cache_holder: "nn.Module | None" = None,
+    v_high_full: "torch.Tensor | None" = None,
 ):
     """Project U_low/V_low (or their gradients) orthogonal to the frozen subspace.
 
@@ -687,9 +688,9 @@ def _project_to_orthogonal_space(
         mode: "grad" to project gradients, "param" to project parameter values.
         skip_u: If True, skip U projection (caller handles it via batched all-reduce).
         cache_holder: Module on which to cache the all-gathered V_high.
+        v_high_full: Pre-computed full V_high (skips _gather_v_high if provided).
     """
     U_high = svd_dict["U_high"]
-    V_high = svd_dict["V_high"]
 
     if mode == "grad":
         u_tensor = svd_dict["U_low"].grad
@@ -710,10 +711,11 @@ def _project_to_orthogonal_space(
         _writeback_local(u_tensor, local_u)
 
     if v_tensor is not None:
-        local_V_high = _to_local(V_high)
         local_v = _to_local(v_tensor)
-        V_high_full = _gather_v_high(local_V_high, svd_dict["rank_high"], cache_holder)
-        _project_V_kernel(local_v, V_high_full)
+        if v_high_full is None:
+            local_V_high = _to_local(svd_dict["V_high"])
+            v_high_full = _gather_v_high(local_V_high, svd_dict["rank_high"], cache_holder)
+        _project_V_kernel(local_v, v_high_full)
         _writeback_local(v_tensor, local_v)
 
 
@@ -1112,31 +1114,43 @@ class OSFTProjectionState:
 
         self.u_shape_groups: list[_UShapeGroup] = groups
         self.u_coeff_total_numel: int = buf_offset
-        self._u_coeff_buffer: torch.Tensor | None = None
-        self._u_gather_buf: torch.Tensor | None = None
         self._u_gather_max_numel: int = max(
             (len(g.indices) * g.m_local * g.rank_low for g in groups), default=0
         )
-        self._groups_materialized: bool = False
 
-    def _ensure_u_coeff_buffer(self, device, dtype):
-        if self._u_coeff_buffer is None or self._u_coeff_buffer.device != device:
-            self._u_coeff_buffer = torch.empty(
-                max(self.u_coeff_total_numel, 1), device=device, dtype=dtype,
-            )
-        return self._u_coeff_buffer
-
-    def _ensure_groups_materialized(self):
-        if self._groups_materialized:
-            return
+        # Eagerly materialize U_high batches per shape group
         for g in self.u_shape_groups:
             locals_ = []
             for idx in g.indices:
-                d = self.svd_dicts[idx]
+                d = svd_dicts[idx]
                 local = d["U_high"]._local_tensor if self.u_high_is_dtensor[idx] else d["U_high"]
                 locals_.append(local)
             g.u_high_batch = torch.stack(locals_)
-        self._groups_materialized = True
+
+        # Eagerly compute V_high_full for each target (all-gather once).
+        # Clear any stale module cache from prior construction (e.g. pre-FSDP2
+        # on CPU) before re-computing with current device placement.
+        v_high_fulls = []
+        for i, (svd_dict, module) in enumerate(zip(svd_dicts, modules)):
+            if hasattr(module, "_osft_v_high_full"):
+                delattr(module, "_osft_v_high_full")
+            local_V_high = svd_dict["V_high"]._local_tensor if self.v_high_is_dtensor[i] else svd_dict["V_high"]
+            V_high_full = _gather_v_high(local_V_high, svd_dict["rank_high"], module)
+            v_high_fulls.append(V_high_full)
+        self.v_high_fulls: list[torch.Tensor] = v_high_fulls
+
+        # Eagerly pre-allocate U projection buffers
+        if groups:
+            ref = _to_local(svd_dicts[groups[0].indices[0]]["U_low"])
+            self._u_coeff_buffer: torch.Tensor = torch.empty(
+                max(self.u_coeff_total_numel, 1), device=ref.device, dtype=ref.dtype,
+            )
+            self._u_gather_buf: torch.Tensor = torch.empty(
+                max(self._u_gather_max_numel, 1), device=ref.device, dtype=ref.dtype,
+            )
+        else:
+            self._u_coeff_buffer = None
+            self._u_gather_buf = None
 
     @classmethod
     def from_model(cls, model) -> "OSFTProjectionState":
@@ -1173,11 +1187,12 @@ def project_all(state: OSFTProjectionState, mode: str):
             return
 
         if not state.is_distributed:
-            for svd_dict, module in zip(svd_dicts, osft_modules):
-                _project_to_orthogonal_space(svd_dict, mode=mode, cache_holder=module)
+            for i, (svd_dict, module) in enumerate(zip(svd_dicts, osft_modules)):
+                _project_to_orthogonal_space(
+                    svd_dict, mode=mode, cache_holder=module, v_high_full=state.v_high_fulls[i],
+                )
             return
 
-        state._ensure_groups_materialized()
         groups = state.u_shape_groups
 
         def _get_local_u(idx):
@@ -1193,16 +1208,11 @@ def project_all(state: OSFTProjectionState, mode: str):
                 first_u = _get_local_u(g.indices[0])
                 if first_u is None:
                     continue
-                buf = state._ensure_u_coeff_buffer(first_u.device, first_u.dtype)
-                if state._u_gather_buf is None or state._u_gather_buf.device != first_u.device:
-                    state._u_gather_buf = torch.empty(
-                        max(state._u_gather_max_numel, 1), device=first_u.device, dtype=first_u.dtype,
-                    )
                 u_buf = state._u_gather_buf[: B * g.m_local * g.rank_low].reshape(B, g.m_local, g.rank_low)
                 for j, idx in enumerate(g.indices):
                     local_u = _get_local_u(idx)
                     u_buf[j].copy_(local_u)
-                coeff_view = buf[g.buf_start : g.buf_start + g.buf_numel].reshape(B, g.rank_high, g.rank_low)
+                coeff_view = state._u_coeff_buffer[g.buf_start : g.buf_start + g.buf_numel].reshape(B, g.rank_high, g.rank_low)
                 torch.bmm(g.u_high_batch.transpose(1, 2), u_buf, out=coeff_view)
 
         if state.u_coeff_total_numel > 0:
@@ -1225,15 +1235,12 @@ def project_all(state: OSFTProjectionState, mode: str):
                         local_u.sub_(u_buf[j])
 
         with record_function("osft::V_projection"):
-            for i, (svd_dict, module) in enumerate(zip(svd_dicts, osft_modules)):
-                V_low = svd_dict["V_low"]
-                v_tensor = V_low.grad if mode == "grad" else V_low.data
+            for i, svd_dict in enumerate(svd_dicts):
+                v_tensor = svd_dict["V_low"].grad if mode == "grad" else svd_dict["V_low"].data
                 if v_tensor is None:
                     continue
-                local_V_high = svd_dict["V_high"]._local_tensor if state.v_high_is_dtensor[i] else svd_dict["V_high"]
                 local_v = v_tensor._local_tensor if state.v_low_is_dtensor[i] else v_tensor
-                V_high_full = _gather_v_high(local_V_high, svd_dict["rank_high"], module)
-                _project_V_kernel(local_v, V_high_full)
+                _project_V_kernel(local_v, state.v_high_fulls[i])
 
 
 def create_osft_model_class(base_cls) -> type[OSFTModel]:
