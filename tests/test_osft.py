@@ -1694,7 +1694,7 @@ class TestVProjectionCache:
 
     def test_cache_populated_after_first_projection(self, monkeypatch):
         """V_high cache should be set on the module after the first call."""
-        monkeypatch.setattr(osft_module, "OSFT_CACHE_V", True)
+
         model = self._create_simple_osft_model()
         model.train()
 
@@ -1723,7 +1723,7 @@ class TestVProjectionCache:
 
     def test_cached_v_high_matches_original(self, monkeypatch):
         """Cached V_high should be identical to the original V_high (single GPU)."""
-        monkeypatch.setattr(osft_module, "OSFT_CACHE_V", True)
+
         model = self._create_simple_osft_model()
         model.train()
 
@@ -1740,7 +1740,7 @@ class TestVProjectionCache:
 
     def test_cache_smaller_than_gram(self, monkeypatch):
         """Cached V_high (k_high, M) should be smaller than the Gram matrix (M, M)."""
-        monkeypatch.setattr(osft_module, "OSFT_CACHE_V", True)
+
         model = self._create_simple_osft_model(hidden_size=32, rank_ratio=0.5)
         model.train()
 
@@ -1838,7 +1838,7 @@ class TestVProjectionCache:
 
     def test_projection_identical_with_and_without_cache(self, monkeypatch):
         """Projection results should be identical whether or not the cache is used."""
-        monkeypatch.setattr(osft_module, "OSFT_CACHE_V", True)
+
         torch.manual_seed(42)
         model = self._create_simple_osft_model()
         model.train()
@@ -1885,10 +1885,8 @@ class TestVProjectionCache:
                     "U_low gradient differs with vs without cache"
                 )
 
-    def test_cache_disabled_by_default(self, monkeypatch):
-        """Cache should not be populated when OSFT_CACHE_V is at its default (off)."""
-        monkeypatch.setattr(osft_module, "OSFT_CACHE_V", False)
-
+    def test_cache_always_populated(self, monkeypatch):
+        """V_high cache is always populated after first projection (V_high is frozen)."""
         model = self._create_simple_osft_model()
         model.train()
 
@@ -1897,14 +1895,16 @@ class TestVProjectionCache:
         loss.backward()
         model.project_gradients()
 
-        for module in model.modules():
-            assert not hasattr(module, "_osft_v_high_full"), (
-                "Cache should not be populated when OSFT_CACHE_V is disabled"
+        osft_modules = [m for m in model.modules() if hasattr(m, "osft_params")]
+        assert len(osft_modules) > 0
+        for module in osft_modules:
+            assert hasattr(module, "_osft_v_high_full"), (
+                "V_high cache should always be populated after projection"
             )
 
     def test_orthogonality_maintained_with_cache(self, monkeypatch):
         """Orthogonality must hold across multiple steps with caching active."""
-        monkeypatch.setattr(osft_module, "OSFT_CACHE_V", True)
+
         model = self._create_simple_osft_model()
         model.train()
         tracker = OrthogonalityTracker(margin_deg=1.0)
@@ -1940,7 +1940,7 @@ class TestVProjectionCache:
         tensors.  Any cached all-gathered V_high from the old decomposition
         would be stale.  This test verifies the cache is cleared.
         """
-        monkeypatch.setattr(osft_module, "OSFT_CACHE_V", True)
+
         model = self._create_simple_osft_model()
         model.train()
 
@@ -1963,7 +1963,7 @@ class TestVProjectionCache:
 
     def test_cache_not_in_state_dict(self, monkeypatch):
         """Cached V_high tensors must not appear in model state_dict."""
-        monkeypatch.setattr(osft_module, "OSFT_CACHE_V", True)
+
         model = self._create_simple_osft_model()
         model.train()
 
@@ -2132,7 +2132,7 @@ class TestUnevenShardDeinterleave:
 
         import torch.distributed as dist
 
-        monkeypatch.setattr(osft_module, "OSFT_CACHE_V", True)
+
 
         k_high, world_size = 7, 3  # uneven: chunk sizes [3, 3, 1]
         M = k_high * 3
@@ -2472,8 +2472,8 @@ class TestPostStepParameterProjection:
             f"AdamW subspace leak detected after {num_steps} steps:\n{tracker.get_summary()}"
         )
 
-    def test_hooks_call_project_parameters(self):
-        """Test that register_osft_hooks calls project_parameters after step."""
+    def test_hooks_project_parameters_after_step(self):
+        """Hooks must project parameters after optimizer.step (orthogonality maintained)."""
         model = self._create_simple_osft_model(hidden_size=16, rank_ratio=0.5)
         model.train()
 
@@ -2481,17 +2481,6 @@ class TestPostStepParameterProjection:
         optimizer = torch.optim.AdamW(osft_params, lr=1e-3)
         register_osft_hooks(optimizer, model)
 
-        # Track calls to project_parameters
-        calls = []
-        original_project_parameters = model.project_parameters
-
-        def tracking_project_parameters():
-            calls.append("project_parameters")
-            return original_project_parameters()
-
-        model.project_parameters = tracking_project_parameters
-
-        # Do a step
         input_data = torch.randn(4, 16)
         target = torch.randn(4, 16)
         output = model.linear(input_data)
@@ -2499,7 +2488,15 @@ class TestPostStepParameterProjection:
         loss.backward()
         optimizer.step()
 
-        assert "project_parameters" in calls, "register_osft_hooks should call project_parameters after step"
+        for module in model.modules():
+            if not hasattr(module, "osft_params"):
+                continue
+            U_high = module.osft_U_high.data
+            U_low = module.osft_params.U_low.data
+            overlap = torch.mm(U_high.t(), U_low).norm().item()
+            assert overlap < 1e-4, (
+                f"U_low should be orthogonal to U_high after hook projection, got overlap={overlap:.2e}"
+            )
 
     def test_project_parameters_multi_target(self):
         """Test post-step projection works with multiple OSFT targets."""
